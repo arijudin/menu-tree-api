@@ -4,19 +4,21 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, TreeRepository, ILike, FindOptionsOrder } from 'typeorm';
+import {
+  DataSource,
+  TreeRepository,
+  ILike,
+  FindOptionsOrder,
+  QueryFailedError,
+} from 'typeorm';
 import { Menu } from './entities/menu.entity';
 import { CreateMenuDto } from './dto/create-menu.dto';
 import { UpdateMenuDto } from './dto/update-menu.dto';
 import { QueryMenuDto } from './dto/query-menu.dto';
+import { isEmptyOrHyphens, unicodeSlug } from 'utils/slug.util';
+import { randomUUID } from 'node:crypto';
 
-function toSlug(s: string) {
-  return s
-    .toLowerCase()
-    .trim()
-    .replace(/[^\w\s-]/g, '')
-    .replace(/\s+/g, '-');
-}
+type WithCode = { code?: unknown };
 
 @Injectable()
 export class MenusService {
@@ -29,10 +31,45 @@ export class MenusService {
     this.repo = this.dataSource.getTreeRepository(Menu);
   }
 
+  private async ensureUniqueSlug(base: string): Promise<string> {
+    if (!(await this.repo.exist({ where: { slug: base } }))) return base;
+
+    let i = 2;
+    while (await this.repo.exist({ where: { slug: `${base}-${i}` } })) {
+      i++;
+    }
+    return `${base}-${i}`;
+  }
+
+  private getPgErrorCode(err: unknown): string | undefined {
+    if (err instanceof QueryFailedError) {
+      const drv: unknown = (err as QueryFailedError).driverError;
+      if (typeof drv === 'object' && drv !== null) {
+        const maybe = drv as WithCode;
+        if (typeof maybe.code === 'string') return maybe.code;
+      }
+      return undefined;
+    }
+
+    if (typeof err === 'object' && err !== null) {
+      const maybe = err as WithCode;
+      if (typeof maybe.code === 'string') return maybe.code;
+    }
+
+    return undefined;
+  }
+
   async create(dto: CreateMenuDto) {
-    const slug = dto.slug?.trim() || toSlug(dto.name);
-    const exists = await this.repo.findOne({ where: { slug } });
-    if (exists) throw new BadRequestException('Slug already exists');
+    const raw = dto.slug?.trim();
+    const sourceForSlug = !isEmptyOrHyphens(raw) ? raw! : (dto.name ?? '');
+
+    let baseSlug = unicodeSlug(sourceForSlug);
+
+    if (!baseSlug) {
+      baseSlug = `menu-${randomUUID().slice(0, 8)}`;
+    }
+
+    const slug = await this.ensureUniqueSlug(baseSlug);
 
     let parent: Menu | null = null;
     if (dto.parentId) {
@@ -40,51 +77,41 @@ export class MenusService {
       if (!parent) throw new NotFoundException('Parent not found');
     }
 
-    return this.dataSource.transaction(async (em) => {
-      const menuRepo = em.getRepository(Menu);
+    let order = dto.order;
+    if (order == null) {
+      const qb = this.repo
+        .createQueryBuilder('menu')
+        .select('COALESCE(MAX(menu."order"), 0)', 'max');
 
-      const lockKey = parent?.id ?? 0;
-      await em.query('SELECT pg_advisory_xact_lock($1)', [lockKey]);
-
-      let nextOrder: number;
-      if (dto.order != null) {
-        nextOrder = dto.order;
+      if (parent?.id) {
+        qb.where('menu."parentId" = :pid', { pid: parent.id });
       } else {
-        const qb = menuRepo
-          .createQueryBuilder('menu')
-          .select('COALESCE(MAX(menu."order"), 0)', 'max');
-
-        if (parent?.id) {
-          qb.where('menu."parentId" = :pid', { pid: parent.id });
-        } else {
-          qb.where('menu."parentId" IS NULL');
-        }
-
-        const { max } = (await qb.getRawOne<{
-          max: string | number | null;
-        }>()) ?? { max: 0 };
-        nextOrder = Number(max ?? 0) + 1;
+        qb.where('menu."parentId" IS NULL');
       }
 
-      const entity = menuRepo.create({
-        name: dto.name.trim(),
-        slug,
-        order: nextOrder,
-        isActive: dto.isActive ?? true,
-        parent,
-      });
+      const rawMax = await qb.getRawOne<{ max: string | number | null }>();
+      order = Number(rawMax?.max ?? 0) + 1;
+    }
 
-      try {
-        return await menuRepo.save(entity);
-      } catch (e: any) {
-        if (e?.code === '23505') {
-          throw new BadRequestException(
-            'Duplicate slug or order for this parent',
-          );
-        }
-        throw e;
-      }
+    const entity = this.repo.create({
+      name: dto.name.trim(),
+      slug,
+      order,
+      isActive: dto.isActive ?? true,
+      parent,
     });
+
+    try {
+      return await this.repo.save(entity);
+    } catch (err: unknown) {
+      const code = this.getPgErrorCode(err);
+      if (code === '23505') {
+        throw new BadRequestException(
+          'Duplicate slug or order for this parent',
+        );
+      }
+      throw err;
+    }
   }
 
   async findTree() {
@@ -150,22 +177,40 @@ export class MenusService {
   }
 
   async update(id: number, dto: UpdateMenuDto) {
-    const menu = await this.findOne(id);
+    const menu = await this.repo.findOne({ where: { id } });
+    if (!menu) throw new NotFoundException('Menu not found');
 
-    if (dto.name) {
-      menu.name = dto.name.trim();
-      menu.slug = toSlug(dto.name);
+    // 1) Name
+    let nameChanged = false;
+    if (dto.name != null) {
+      const trimmed = dto.name.trim();
+      nameChanged = trimmed !== '' && trimmed !== menu.name;
+      menu.name = trimmed;
     }
-    if (dto.slug) {
-      const slug = dto.slug.trim();
-      const dupe = await this.repo.findOne({ where: { slug } });
-      if (dupe && dupe.id !== id)
-        throw new BadRequestException('Slug already exists');
-      menu.slug = slug;
-    }
-    if (dto.order !== undefined) menu.order = dto.order;
-    if (dto.isActive !== undefined) menu.isActive = dto.isActive;
 
+    // 2) Slug
+    if (dto.slug !== undefined) {
+      // explicit override / reslug via slug field
+      const raw = dto.slug?.trim() ?? '';
+      const source = !isEmptyOrHyphens(raw)
+        ? raw
+        : (dto.name?.trim() ?? menu.name ?? '');
+      let baseSlug = unicodeSlug(source);
+      if (!baseSlug) baseSlug = `menu-${randomUUID().slice(0, 8)}`;
+      if (baseSlug !== menu.slug) {
+        menu.slug = await this.ensureUniqueSlug(baseSlug);
+      }
+    } else if (nameChanged) {
+      // ⬅️ auto-reslug when name changed AND slug not provided
+      const source = menu.name ?? '';
+      let baseSlug = unicodeSlug(source);
+      if (!baseSlug) baseSlug = `menu-${randomUUID().slice(0, 8)}`;
+      if (baseSlug !== menu.slug) {
+        menu.slug = await this.ensureUniqueSlug(baseSlug);
+      }
+    }
+
+    // 3) Parent (opsional, jika kamu izinkan pindah parent di update)
     if (dto.parentId !== undefined) {
       if (dto.parentId === null) {
         menu.parent = null;
@@ -186,9 +231,28 @@ export class MenusService {
         }
         menu.parent = newParent;
       }
+      // (opsional) jika parent berubah, kamu mungkin ingin menghitung ulang "order"
     }
 
-    return this.repo.save(menu);
+    // 4) Order/isActive (opsional)
+    if (dto.order !== undefined && dto.order !== null) {
+      menu.order = dto.order;
+    }
+    if (dto.isActive !== undefined && dto.isActive !== null) {
+      menu.isActive = dto.isActive;
+    }
+
+    try {
+      return await this.repo.save(menu);
+    } catch (err: unknown) {
+      const code = this.getPgErrorCode(err);
+      if (code === '23505') {
+        throw new BadRequestException(
+          'Duplicate slug or order for this parent',
+        );
+      }
+      throw err;
+    }
   }
 
   async remove(id: number) {
